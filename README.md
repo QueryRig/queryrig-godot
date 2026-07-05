@@ -18,15 +18,43 @@ of the QueryRig engine SDK spec (`docs/sdk-spec.md` in the queryrig repo).
 
 ## Install
 
-Copy `addons/queryrig/` into your project and enable **QueryRig** in
-Project Settings → Plugins (this registers the `QueryRig` autoload).
+1. Copy the `addons/queryrig/` folder from this repo into your project's own
+   `addons/` folder (so you end up with `res://addons/queryrig/`).
+2. In the top menu, open **Project → Project Settings…**, click the
+   **Plugins** tab, find **QueryRig** in the list, and check its **Enable**
+   box. Close the settings window.
+
+That's it — no code. This registers `QueryRig` as a global object your whole
+project can reach, and it starts itself automatically when the game runs.
 
 ## Use
 
+Godot 4 doesn't ship a visual-scripting system, so there is one line of
+GDScript to add per event you want to track — everything else (batching,
+retries, sessions) is automatic. The fastest way to add that line without
+writing a script from scratch:
+
+1. Select the node you want to trigger tracking from (e.g. a `Button`).
+2. In the editor's bottom-right dock, open the **Node** tab (next to
+   **Inspector**) and double-click the signal you want — for a button,
+   that's `pressed()`.
+3. Click **Connect**. Godot creates a script (if the node doesn't have one
+   yet) and jumps you straight to a new, empty function it wrote for you.
+4. Add one line inside that function:
+
 ```gdscript
-QueryRig.track("level_complete", {"level": 3, "duration_s": 82.5})
-QueryRig.track("item_pickup", {"item": "sword"})
-QueryRig.set_player_id(steam_id)   # optional; defaults to a stable device id
+func _on_button_pressed() -> void:
+	QueryRig.track("level_complete", {"level": 3, "duration_s": 82.5})
+```
+
+Everything past `QueryRig.track(` is yours to edit — first argument is the
+event name, second is a dictionary of whatever details matter (or leave it
+out entirely: `QueryRig.track("item_pickup")`).
+
+Optional, for games with their own account/login system:
+
+```gdscript
+QueryRig.set_player_id(steam_id)   # defaults to a stable per-device id
 ```
 
 `session_id`, `player_id`, `platform`, `build_version`, `timestamp`, and
@@ -36,9 +64,13 @@ with a 30-minute idle rollover.
 
 ## Configure
 
-Copy `queryrig.example.json` to `queryrig.json` in the project root (`res://`)
-and set your ingest key and endpoint — both come from the Keys tab of your
-QueryRig project:
+1. In your file manager (or the Godot editor's **FileSystem** dock), find
+   `queryrig.example.json` next to `project.godot` and make a copy of it
+   named `queryrig.json`, in that same folder.
+2. Open `queryrig.json` in any text editor and fill in `api_key` and
+   `endpoint` — both are shown on the **Keys** tab of your QueryRig project
+   (the dashboard at your QueryRig site). Leave the quotes in place; only
+   change what's between them.
 
 ```json
 {
