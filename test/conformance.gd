@@ -53,32 +53,44 @@ func _test_delivery_and_stamping() -> void:
 	_rig.track("level_complete", {"level": 3, "duration_s": 82.5})
 	_rig.track("item_pickup", {"item": "sword"})
 	_rig.track("enemy_killed", {"enemy": "slime"})
+	# No event_name at all: nothing is reserved, so an event is any set of
+	# fields. Proves the server accepts the studio's own vocabulary.
+	_rig.track_fields({"kind": "boss_defeated", "boss": "warden"})
 	_rig.flush()
 
-	# 3 tracked + the automatic session_start.
-	_check(_wait_for_rows(4), "delivery: 4 rows arrive after flush")
+	# 4 tracked + the automatic session_start.
+	_check(_wait_for_rows(5), "delivery: 5 rows arrive after flush")
 	var rows: Array = _req("GET", "/__harness/rows")["json"]
-	var names := rows.map(func(r): return r["event_name"])
+	# Only timestamp/received_at/event_id (+ project_id) are columns; every
+	# other field the SDK sends lands in `properties` under its own name.
+	var names := rows.map(func(r): return r["properties"].get("event_name", ""))
 	_check("session_start" in names and "level_complete" in names, "delivery: session_start + tracked events present")
 
 	var sessions := {}
 	var ids := {}
 	var stamped := true
+	var unnamed := {}
 	for r in rows:
-		sessions[r["session_id"]] = true
+		var p: Dictionary = r["properties"]
+		sessions[p["session_id"]] = true
 		ids[r["event_id"]] = true
-		stamped = stamped and not String(r["player_id"]).is_empty() and not String(r["platform"]).is_empty()
+		stamped = stamped and not String(p["player_id"]).is_empty() and not String(p["platform"]).is_empty()
+		if not p.has("event_name"):
+			unnamed = p
 	_check(stamped, "stamping: player_id + platform set on every row")
 	_check(sessions.size() == 1, "stamping: one session_id across the batch")
 	_check(ids.size() == rows.size(), "stamping: event_ids unique")
+	_check(unnamed.get("kind", "") == "boss_defeated" and unnamed.get("boss", "") == "warden",
+		"fields: an event with no event_name is accepted and keeps its own fields")
 
-	var lvl := {}
+	var props := {}
 	for r in rows:
-		if r["event_name"] == "level_complete":
-			lvl = r
-	var props: Dictionary = lvl.get("properties", {})
-	_check(int(props.get("level", -1)) == 3 and is_equal_approx(float(props.get("duration_s", 0)), 82.5),
-		"stamping: properties survive normalization")
+		if r["properties"].get("event_name", "") == "level_complete":
+			props = r["properties"]
+	# Every property scalar is stored as a string, whatever the client sent —
+	# one type per path, so equality in a query always works.
+	_check(String(props.get("level", "")) == "3" and String(props.get("duration_s", "")) == "82.5",
+		"stamping: property values arrive as strings")
 
 	var reqs: Array = _req("GET", "/__harness/requests")["json"]
 	_check(String(reqs[0]["userAgent"]).begins_with("queryrig-godot/"), "wire: User-Agent identifies the SDK")

@@ -62,6 +62,25 @@ QueryRig.set_player_id(steam_id)   # defaults to a stable per-device id
 dictionary win). `session_start` / `session_end` events are emitted for you,
 with a 30-minute idle rollover.
 
+### Your fields, your names
+
+Nothing is reserved. Apart from `timestamp` and `event_id`, every field you
+send is stored under the name you gave it — including `event_name`, which is
+just the name the dashboard's query templates look for by default. If your
+game already has its own vocabulary, send it and skip the event name entirely:
+
+```gdscript
+QueryRig.track_fields({"kind": "boss_defeated", "boss": "warden", "attempts": 4})
+```
+
+Then point the templates at `kind` instead of `event_name` (every template
+takes the field name). Use `track()` when you have no reason not to — matching
+the convention means charts work with no configuration.
+
+Values are stored as text, so query them quoted (`properties.attempts = '4'`)
+and cast when you need arithmetic (`toInt64OrNull(toString(properties.attempts))`).
+Send natural types here — the conversion happens server-side.
+
 ## Configure
 
 1. In your file manager (or the Godot editor's **FileSystem** dock), find

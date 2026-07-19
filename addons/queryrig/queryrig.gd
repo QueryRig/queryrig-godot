@@ -164,13 +164,28 @@ func shutdown() -> void:
 
 # ---------------------------------------------------------------- public API
 
-## Queue an event. Safe from any thread; never blocks on I/O.
+## Queue an event under a name. Safe from any thread; never blocks on I/O.
+##
+## The name is sent as the `event_name` field, which is what the dashboard's
+## query templates look for by default — it is a convention, not a requirement.
 func track(event_name: String, props: Dictionary = {}) -> void:
+	var fields := props.duplicate()
+	fields["event_name"] = event_name
+	track_fields(fields)
+
+
+## Queue an event with no name — the fields are entirely yours.
+##
+## Nothing is reserved server-side: an event is any set of fields, and the only
+## rule is that it carries at least one. Use this when the game already has its
+## own vocabulary (`{"kind": "boss_defeated", ...}`) and point the dashboard's
+## templates at that field instead of `event_name`.
+func track_fields(props: Dictionary) -> void:
 	if _inert or not _collecting() or not _sampled_in:
 		return
 	_maybe_rollover_session()
 	_last_event_ms = _now_ms()
-	_enqueue(_stamp(event_name, props))
+	_enqueue(_stamp(props))
 
 
 ## Override the default (device-derived) player id.
@@ -250,14 +265,14 @@ func _start_session() -> void:
 	var rate := clampf(float(_config["sample_rate"]), 0.0, 1.0)
 	_sampled_in = (hash(_session_id) & 0x7fffffff) % 10_000 < int(rate * 10_000)
 	if _sampled_in and _collecting():
-		_enqueue(_stamp("session_start", {}))
+		_enqueue(_stamp({"event_name": "session_start"}))
 
 
 func _end_session() -> void:
 	if _session_id.is_empty() or not _sampled_in or not _collecting():
 		return
 	var duration := (_now_ms() - _session_start_ms) / 1000.0
-	_enqueue(_stamp("session_end", {"duration_s": duration}))
+	_enqueue(_stamp({"event_name": "session_end", "duration_s": duration}))
 
 
 func _maybe_rollover_session() -> void:
@@ -269,9 +284,13 @@ func _maybe_rollover_session() -> void:
 
 # Stamp everything at enqueue time (spec §3.3) so retries can't change the
 # event. Explicit values in props win over SDK defaults.
-func _stamp(event_name: String, props: Dictionary) -> Dictionary:
+#
+# Values are sent as their natural JSON types; the server coerces every scalar
+# to a string so each field has one predictable type to query. Never
+# pre-stringify here — that would lose the distinction between "not sent" and
+# "sent empty".
+func _stamp(props: Dictionary) -> Dictionary:
 	var ev := props.duplicate(true)
-	ev["event_name"] = event_name
 	if not ev.has("event_id"):
 		ev["event_id"] = _uuid4()
 	if not ev.has("timestamp"):
