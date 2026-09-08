@@ -5,12 +5,11 @@ durable event tracking with a runtime on/off switch. Reference implementation
 of the QueryRig engine SDK spec (`docs/sdk-spec.md` in the queryrig repo).
 
 - **Batched** — events queue in memory and flush every 5 s / 100 events, one
-  HTTP request instead of dozens. `track()` costs sub-microseconds on the
-  calling thread; all I/O runs on a worker thread.
-- **Durable** — delivery failures spill to a disk queue (`user://queryrig/`)
-  and replay with exponential backoff. Events carry client-generated
-  `event_id`s, so retries are deduplicated server-side: crash-safe,
-  duplicate-free, offline-tolerant.
+  HTTP request instead of dozens. `track()` validates, stamps, and serializes
+  an immutable snapshot; delivery disk I/O and HTTP run on a worker thread.
+- **Persistent retries** — batches are written to a scoped disk queue before
+  sending and retained until acknowledged. Retries preserve event IDs and
+  timestamps and honor exponential backoff. See the limits below.
 - **Runtime-switchable** — telemetry on/off is never a rebuild: a
   `queryrig.json` next to the build, an env var, or the remote gate (flip the
   ingest key in the QueryRig dashboard and the installed fleet obeys within
@@ -110,12 +109,33 @@ rebuilding.
 | Value | Behavior |
 |---|---|
 | `false` | Hard off. Zero network calls — verifiable with a packet capture. |
-| `true` | Send unconditionally. |
+| `true` | Collect locally; authentication failures pause sending, with gate checks allowing recovery. |
 | `"remote"` | The server decides: the SDK polls `/v1/config` and obeys the ingest key's enabled state, so telemetry can be flipped after the build has shipped. |
 
 Optional fields: `flush_interval_s` (5), `flush_max_events` (100),
 `disk_queue_max_bytes` (8 MB), `sample_rate` (1.0, sampled per session so
 funnels stay coherent).
+
+## Delivery limits and upgrading
+
+Call the SDK on Godot's main thread. Tracking validates and serializes JSON
+immediately, so changing nested properties after the call cannot alter queued
+events. Cycles, non-finite numbers, unsupported values, excessive depth, and
+events exceeding 200 KB in UTF-8 are discarded individually with a warning.
+
+Batches are written via temporary files and renamed before HTTP starts.
+Shutdown interrupts HTTP and attempts to persist pending events even while
+dormant; local disk operations can still block or fail. Events still in memory
+can be lost on a crash before a flush. Memory (10,000 events) and disk (8 MB by
+default) are capped and evict oldest entries. This is not an unlimited or
+exactly-once delivery guarantee. Server retention still applies to offline events.
+
+Queue and gate-cache paths are now `user://queryrig/<endpoint-and-key-fingerprint>/`.
+Changing the endpoint **or key** isolates the old queue, including rotations
+within the same project. Drain before rotating credentials. Old unscoped files
+are left intact but are **not automatically replayed**; recover them only after
+verifying the destination project. The backend must preserve historical
+timestamps for retry-safe deduplication beyond seven days.
 
 ## Demo
 
@@ -135,3 +155,6 @@ godot --headless --path . -s res://test/conformance.gd
 Exercises delivery + stamping, an outage (zero loss, zero duplicates after
 disk-queue replay), the remote kill switch both directions, and hard-off
 silence. Exit code 0 on pass.
+
+Local regressions without a server:
+`godot --headless --path . -s res://test/regression.gd`.

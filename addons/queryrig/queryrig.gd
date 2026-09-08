@@ -6,10 +6,9 @@ extends Node
 # Design contract, in order:
 #  1. Telemetry behavior is a runtime decision — config file, env var, or the
 #     remote gate. Never a rebuild.
-#  2. Accepted events are never lost: memory queue -> disk spill -> replay,
-#     with client-generated event_ids so retries are dedupe-safe server-side.
-#  3. track() never costs a frame: it stamps and enqueues; serialization,
-#     disk, and HTTP happen on a worker thread.
+#  2. Persist batches before sending; preserve identity for retries.
+#     Caps, crashes before persistence, and disk failures can lose events.
+#  3. Main-thread tracking validates and serializes; delivery I/O uses a worker.
 #
 # Usage (autoload "QueryRig", added by the editor plugin):
 #   QueryRig.track("level_complete", {"level": 3, "duration_s": 82.5})
@@ -37,8 +36,8 @@ const _DEFAULTS := {
 	"gate_poll_interval_s": GATE_POLL_S,
 }
 
-const _DATA_DIR := "user://queryrig"
-const _QUEUE_DIR := "user://queryrig/queue"
+var _DATA_DIR := "user://queryrig"
+var _QUEUE_DIR := "user://queryrig/queue"
 
 var _config: Dictionary = {}
 var _booted := false
@@ -74,6 +73,7 @@ var _http_timeout_ms := 5_000
 var _flush_timer: Timer
 var _gate_timer: Timer
 var _crypto := Crypto.new()
+var _crypto_mutex := Mutex.new()
 
 
 # ---------------------------------------------------------------- lifecycle
@@ -86,8 +86,14 @@ func _ready() -> void:
 ## Resolve config and start the SDK. Called automatically as an autoload;
 ## call directly with overrides for tests or manual setup. Safe to re-call.
 func init(overrides: Dictionary = {}) -> void:
+	if not _on_main_thread():
+		push_error("QueryRig: init must run on the main thread")
+		return
 	if _booted:
 		shutdown()
+	if not _queue.is_empty():
+		push_error("QueryRig: cannot reconfigure while old events could not be persisted")
+		return
 	_config = _resolve_config(overrides)
 	_booted = true
 
@@ -101,6 +107,15 @@ func init(overrides: Dictionary = {}) -> void:
 		return
 	_inert = false
 	_quitting = false
+	_http_timeout_ms = 5_000
+	_jobs.clear()
+	_jobs_sem = Semaphore.new()
+	_next_drain_ms = 0
+	_consecutive_failures = 0
+	# Never transfer a legacy/unrelated queue to a newly configured project.
+	var identity := (String(_config["endpoint"]).trim_suffix("/") + "\n" + String(_config["api_key"])).sha256_text()
+	_DATA_DIR = "user://queryrig/" + identity
+	_QUEUE_DIR = _DATA_DIR + "/queue"
 
 	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(_QUEUE_DIR))
 	_player_id = _default_player_id()
@@ -116,12 +131,13 @@ func init(overrides: Dictionary = {}) -> void:
 	_flush_timer.timeout.connect(_on_flush_timer)
 	add_child(_flush_timer)
 
-	if enabled is String:  # "remote"
-		_gate_timer = Timer.new()
-		_gate_timer.wait_time = maxf(1.0, float(_config["gate_poll_interval_s"]))
-		_gate_timer.autostart = true
-		_gate_timer.timeout.connect(func() -> void: _post_job("gate"))
-		add_child(_gate_timer)
+	# Hard-on must still recover after a temporary authentication failure.
+	_gate_timer = Timer.new()
+	_gate_timer.wait_time = maxf(1.0, float(_config["gate_poll_interval_s"]))
+	_gate_timer.autostart = true
+	_gate_timer.timeout.connect(func() -> void: _post_job("gate"))
+	add_child(_gate_timer)
+	if enabled is String:
 		_post_job("gate")
 
 	_start_session()
@@ -140,17 +156,23 @@ func _exit_tree() -> void:
 	shutdown()
 
 
-## Final flush with a short deadline, then stop the worker thread. Blocking,
-## bounded by the reduced HTTP timeout.
+## Interrupt HTTP, persist pending events, and join the worker thread.
+## Blocking local disk operations can still take time or fail.
 func shutdown() -> void:
+	if not _on_main_thread():
+		push_error("QueryRig: shutdown must run on the main thread")
+		return
 	if _inert or not _booted or _quitting:
 		_booted = false
 		return
 	_quitting = true
-	_http_timeout_ms = 2_000
 	_end_session()
-	_post_job("flush")
-	_post_job("quit")
+	# Prioritize local persistence, not a backlog of network jobs.
+	_jobs_mutex.lock()
+	_jobs.clear()
+	_jobs.append("quit")
+	_jobs_mutex.unlock()
+	_jobs_sem.post()
 	if _thread and _thread.is_started():
 		_thread.wait_to_finish()
 	_thread = null
@@ -160,15 +182,21 @@ func shutdown() -> void:
 	_flush_timer = null
 	_gate_timer = null
 	_booted = false
+	_inert = true
+	if not _queue.is_empty():
+		push_warning("QueryRig: shutdown persistence failed; events remain memory-only")
 
 
 # ---------------------------------------------------------------- public API
 
-## Queue an event under a name. Safe from any thread; never blocks on I/O.
+## Queue an event under a name on the main thread; no delivery I/O here.
 ##
 ## The name is sent as the `event_name` field, which is what the dashboard's
 ## query templates look for by default — it is a convention, not a requirement.
 func track(event_name: String, props: Dictionary = {}) -> void:
+	if not _on_main_thread():
+		push_error("QueryRig: tracking must run on the main thread")
+		return
 	var fields := props.duplicate()
 	fields["event_name"] = event_name
 	track_fields(fields)
@@ -181,15 +209,25 @@ func track(event_name: String, props: Dictionary = {}) -> void:
 ## own vocabulary (`{"kind": "boss_defeated", ...}`) and point the dashboard's
 ## templates at that field instead of `event_name`.
 func track_fields(props: Dictionary) -> void:
-	if _inert or not _collecting() or not _sampled_in:
+	if not _on_main_thread():
+		push_error("QueryRig: tracking must run on the main thread")
+		return
+	if _inert or _quitting or not _collecting():
 		return
 	_maybe_rollover_session()
 	_last_event_ms = _now_ms()
-	_enqueue(_stamp(props))
+	if _sampled_in:
+		if _valid_json(props):
+			_enqueue(_stamp(props))
+		else:
+			push_warning("QueryRig: invalid event properties discarded")
 
 
 ## Override the default (device-derived) player id.
 func set_player_id(id: String) -> void:
+	if not _on_main_thread():
+		push_error("QueryRig: set_player_id must run on the main thread")
+		return
 	_player_id = id
 
 
@@ -307,9 +345,16 @@ func _stamp(props: Dictionary) -> Dictionary:
 
 
 func _enqueue(ev: Dictionary) -> void:
+	if not _valid_json(ev):
+		push_warning("QueryRig: invalid event discarded")
+		return
+	var line := JSON.stringify(ev)
+	if line.to_utf8_buffer().size() + 2 > FLUSH_MAX_BYTES:
+		push_warning("QueryRig: oversized event discarded")
+		return
 	var request_flush := false
 	_queue_mutex.lock()
-	_queue.append(ev)
+	_queue.append(line)  # immutable snapshot; no caller-owned nested objects
 	while _queue.size() > MEMORY_QUEUE_MAX:  # drop OLDEST on overflow
 		_queue.pop_front()
 		_dropped_overflow += 1
@@ -343,6 +388,9 @@ func _collecting() -> bool:
 
 func _post_job(job: String) -> void:
 	_jobs_mutex.lock()
+	if _quitting or _jobs.has(job):
+		_jobs_mutex.unlock()
+		return
 	_jobs.append(job)
 	_jobs_mutex.unlock()
 	_jobs_sem.post()
@@ -356,6 +404,7 @@ func _worker_loop() -> void:
 		_jobs_mutex.unlock()
 		match job:
 			"quit":
+				_do_flush()  # persist only; network is disabled while quitting
 				break
 			"flush":
 				_do_flush()
@@ -365,16 +414,9 @@ func _worker_loop() -> void:
 				_do_gate_check()
 
 
-# Serialize the queue into spec-sized batches and send. On retryable failure
-# the batch goes to disk; nothing is ever silently discarded except events the
-# server rejects as invalid (those are integration bugs, logged loudly).
+# Persist immutable events in spec-sized batches before any send attempt.
+# Configured queue caps and storage failures remain limits on durability.
 func _do_flush() -> void:
-	_state_mutex.lock()
-	var dormant := _dormant
-	_state_mutex.unlock()
-	if dormant:
-		return
-
 	_queue_mutex.lock()
 	var events: Array = _queue
 	_queue = []
@@ -388,33 +430,31 @@ func _do_flush() -> void:
 		return
 
 	var lines: Array[String] = []
-	for ev in events:
-		lines.append(JSON.stringify(ev))
+	for line in events:
+		lines.append(line)
 
-	var all_ok := true
 	for batch in _split_batches(lines):
-		match _send_batch(batch):
-			"delivered":
-				pass
-			"rejected":
-				_append_rejected(batch)
-			_:  # retryable or dormant: spill; the drain loop owns retries
-				_spill_to_disk(batch)
-				all_ok = false
-	if all_ok:
+		if not _spill_to_disk(batch):
+			_queue_mutex.lock()
+			_queue = batch + _queue
+			while _queue.size() > MEMORY_QUEUE_MAX:
+				_queue.pop_front()
+				_dropped_overflow += 1
+			_queue_mutex.unlock()
+	if not _quitting:
 		_drain_disk_one()
 
 
 static func _split_batches(lines: Array[String]) -> Array:
 	var batches := []
 	var current: Array[String] = []
-	var bytes := 0
+	var bytes := 2
 	for line in lines:
-		var n := line.to_utf8_buffer().size()
+		var n := line.to_utf8_buffer().size() + 1
 		if current.size() >= MAX_BATCH_EVENTS or (bytes + n > FLUSH_MAX_BYTES and not current.is_empty()):
 			batches.append(current)
 			current = []
-			bytes = 0
+			bytes = 2
 		current.append(line)
 		bytes += n
 	if not current.is_empty():
@@ -426,12 +466,23 @@ static func _split_batches(lines: Array[String]) -> Array:
 # do with the lines, so a disk-drained batch is never re-spilled into a
 # duplicate file. Returns "delivered" | "rejected" | "retryable" | "dormant".
 func _send_batch(lines: Array[String]) -> String:
+	_state_mutex.lock()
+	var blocked := _dormant or _now_ms() < _next_drain_ms
+	_state_mutex.unlock()
+	if _quitting or blocked:
+		return "retryable"
 	var body := "[" + ",".join(lines) + "]"
 	var res := _http(HTTPClient.METHOD_POST, String(_config["endpoint"]), body)
 
 	if res["ok"] and res["code"] == 200:
-		_note_success()
 		var parsed = JSON.parse_string(String(res["body"]))
+		if not parsed is Dictionary or not parsed.get("accepted") is float or not parsed.get("rejected") is float:
+			_note_failure()
+			return "retryable"
+		if parsed["accepted"] < 0 or parsed["rejected"] < 0 or parsed["accepted"] + parsed["rejected"] != lines.size():
+			_note_failure()
+			return "retryable"
+		_note_success()
 		if parsed is Dictionary and int(parsed.get("rejected", 0)) > 0:
 			push_warning("QueryRig: server rejected %d event(s): %s" % [
 				int(parsed["rejected"]), JSON.stringify(parsed.get("results", []))])
@@ -457,22 +508,32 @@ func _send_batch(lines: Array[String]) -> String:
 
 # ---------------------------------------------------------------- disk queue
 
-func _spill_to_disk(lines: Array[String]) -> void:
-	var name := "%s/%d_%06d.ndjson" % [_QUEUE_DIR, _now_ms(), randi() % 1_000_000]
-	var f := FileAccess.open(name, FileAccess.WRITE)
+func _spill_to_disk(lines: Array[String]) -> bool:
+	var name := "%s/%d_%s.ndjson" % [_QUEUE_DIR, _now_ms(), _uuid4()]
+	var f := FileAccess.open(name + ".tmp", FileAccess.WRITE)
 	if not f:
-		push_warning("QueryRig: cannot write disk queue; %d events lost" % lines.size())
-		return
+		push_warning("QueryRig: cannot persist %d events; retaining in memory" % lines.size())
+		return false
 	f.store_string("\n".join(lines))
+	f.flush()
+	var error := f.get_error()
 	f.close()
+	if error != OK:
+		return false
+	if DirAccess.rename_absolute(ProjectSettings.globalize_path(name + ".tmp"), ProjectSettings.globalize_path(name)) != OK:
+		return false
 	_enforce_disk_cap()
+	return true
 
 
 func _queue_files() -> PackedStringArray:
 	var dir := DirAccess.open(_QUEUE_DIR)
 	if not dir:
 		return PackedStringArray()
-	var files := dir.get_files()
+	var files := PackedStringArray()
+	for file in dir.get_files():
+		if file.ends_with(".ndjson"):
+			files.append(file)
 	files.sort()  # timestamp-named => oldest first
 	return files
 
@@ -483,12 +544,16 @@ func _enforce_disk_cap() -> void:
 	var total := 0
 	var sizes := {}
 	for file in files:
-		var sz := FileAccess.get_file_as_bytes(_QUEUE_DIR + "/" + file).size()
+		var f := FileAccess.open(_QUEUE_DIR + "/" + file, FileAccess.READ)
+		var sz := f.get_length() if f else 0
+		if f:
+			f.close()
 		sizes[file] = sz
 		total += sz
 	var i := 0
 	while total > cap and i < files.size():  # drop OLDEST first
 		DirAccess.remove_absolute(ProjectSettings.globalize_path(_QUEUE_DIR + "/" + files[i]))
+		push_warning("QueryRig: disk cap evicted an oldest batch")
 		total -= sizes[files[i]]
 		i += 1
 
@@ -496,6 +561,8 @@ func _enforce_disk_cap() -> void:
 # Send at most one disk batch (spec §3.6: a trickle, not a burst), honoring
 # the failure backoff. Original event_ids/timestamps ride along unchanged.
 func _drain_disk_one() -> void:
+	if _quitting:
+		return
 	_state_mutex.lock()
 	var blocked := _dormant or _now_ms() < _next_drain_ms
 	_state_mutex.unlock()
@@ -505,7 +572,13 @@ func _drain_disk_one() -> void:
 	if files.is_empty():
 		return
 	var path := _QUEUE_DIR + "/" + files[0]
-	var text := FileAccess.get_file_as_string(path)
+	var stored := FileAccess.open(path, FileAccess.READ)
+	if not stored:
+		return  # a read error is not an empty, acknowledged file
+	var text := stored.get_as_text()
+	if stored.get_error() not in [OK, ERR_FILE_EOF]:
+		return
+	stored.close()
 	var lines: Array[String] = []
 	for line in text.split("\n"):
 		if not line.strip_edges().is_empty():
@@ -556,6 +629,8 @@ func _note_failure() -> void:
 # ---------------------------------------------------------------- remote gate
 
 func _do_gate_check() -> void:
+	if _quitting:
+		return
 	var url := _origin(String(_config["endpoint"])) + "/v1/config"
 	var res := _http(HTTPClient.METHOD_GET, url, "")
 	var enabled: Variant = null
@@ -608,7 +683,7 @@ func _http(method: int, url: String, body: String) -> Dictionary:
 
 	while client.get_status() in [HTTPClient.STATUS_CONNECTING, HTTPClient.STATUS_RESOLVING]:
 		client.poll()
-		if Time.get_ticks_msec() > deadline:
+		if _quitting or Time.get_ticks_msec() > deadline:
 			return {"ok": false, "code": 0, "body": ""}
 		OS.delay_msec(5)
 	if client.get_status() != HTTPClient.STATUS_CONNECTED:
@@ -623,7 +698,7 @@ func _http(method: int, url: String, body: String) -> Dictionary:
 		return {"ok": false, "code": 0, "body": ""}
 	while client.get_status() == HTTPClient.STATUS_REQUESTING:
 		client.poll()
-		if Time.get_ticks_msec() > deadline:
+		if _quitting or Time.get_ticks_msec() > deadline:
 			return {"ok": false, "code": 0, "body": ""}
 		OS.delay_msec(5)
 	if not client.has_response():
@@ -632,6 +707,8 @@ func _http(method: int, url: String, body: String) -> Dictionary:
 	var code := client.get_response_code()
 	var buf := PackedByteArray()
 	while client.get_status() == HTTPClient.STATUS_BODY:
+		if _quitting or Time.get_ticks_msec() > deadline:
+			return {"ok": false, "code": 0, "body": ""}
 		client.poll()
 		var chunk := client.read_response_body_chunk()
 		if chunk.size() > 0:
@@ -696,7 +773,9 @@ func _default_player_id() -> String:
 
 
 func _uuid4() -> String:
+	_crypto_mutex.lock()
 	var b := _crypto.generate_random_bytes(16)
+	_crypto_mutex.unlock()
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
 	var hex := b.hex_encode()
@@ -705,3 +784,25 @@ func _uuid4() -> String:
 
 static func _now_ms() -> int:
 	return int(Time.get_unix_time_from_system() * 1000.0)
+
+
+static func _valid_json(value: Variant, depth: int = 0) -> bool:
+	if depth >= 8 and (value is Dictionary or value is Array):
+		return false  # also bounds cyclic containers
+	if value is Dictionary:
+		for key in value:
+			if not key is String or not _valid_json(value[key], depth + 1):
+				return false
+		return true
+	if value is Array:
+		for item in value:
+			if not _valid_json(item, depth + 1):
+				return false
+		return true
+	if value is float:
+		return is_finite(value)
+	return value == null or value is String or value is bool or value is int
+
+
+static func _on_main_thread() -> bool:
+	return OS.get_thread_caller_id() == OS.get_main_thread_id()
