@@ -30,8 +30,10 @@ func _initialize() -> void:
 	root.add_child(_rig)
 
 	_test_delivery_and_stamping()
+	_test_slow_fallback()
 	_test_outage_no_loss()
 	_test_remote_kill_switch()
+	_test_shutdown_cancels_upload()
 	_test_hard_off_is_silent()
 
 	_rig.init({"enabled": false})  # quiet shutdown
@@ -96,6 +98,23 @@ func _test_delivery_and_stamping() -> void:
 	_check(String(reqs[0]["userAgent"]).begins_with("queryrig-godot/"), "wire: User-Agent identifies the SDK")
 
 
+func _test_slow_fallback() -> void:
+	# Let the preceding acknowledgement settle before measuring a new upload.
+	OS.delay_msec(200)
+	var before: int = _state()["rows"]
+	var requests_before := _events_request_count()
+	_req("POST", "/__harness/mode", '{"events":"slow-fallback"}')
+	_rig.track("slow_fallback", {})
+	_rig.flush()
+	_check(_wait_for_rows(before + 1, 22.0), "fallback: a 16-second R2 acknowledgement arrives")
+	OS.delay_msec(300)
+	_rig.flush()  # would resend the persisted batch if the acknowledgement was lost
+	OS.delay_msec(500)
+	_check(_events_request_count() == requests_before + 1, "fallback: exactly one POST, no premature retry")
+	_check(int(_rig.get("_consecutive_failures")) == 0, "fallback: slow success does not enter backoff")
+	_req("POST", "/__harness/mode", '{"events":"ok"}')
+
+
 func _test_outage_no_loss() -> void:
 	var before: int = _state()["rows"]
 	_req("POST", "/__harness/mode", '{"events":"unavailable"}')
@@ -136,6 +155,23 @@ func _test_remote_kill_switch() -> void:
 	_req("POST", "/__harness/keys", '{"key":"test-key","disabled":false}')
 	_rig.refresh_gate()
 	_check(_wait_until(func(): return _rig.is_enabled(), 5.0), "gate: re-enable turns the SDK back on")
+
+
+func _test_shutdown_cancels_upload() -> void:
+	# Drain current data before hanging one known upload.
+	_rig.flush()
+	OS.delay_msec(300)
+	_req("POST", "/__harness/mode", '{"events":"hang"}')
+	var before := _events_request_count()
+	_rig.track("shutdown_in_flight", {})
+	_rig.flush()
+	_check(_wait_until(func(): return _events_request_count() > before), "shutdown: upload is in flight")
+	var started := Time.get_ticks_msec()
+	_rig.shutdown()
+	_check(Time.get_ticks_msec() - started < 2000, "shutdown: cancels upload without waiting 30 seconds")
+	var files := DirAccess.get_files_at(String(_rig.get("_QUEUE_DIR")))
+	_check(files.size() > 0, "shutdown: unacknowledged disk batch retained")
+	_req("POST", "/__harness/mode", '{"events":"ok"}')
 
 
 func _test_hard_off_is_silent() -> void:

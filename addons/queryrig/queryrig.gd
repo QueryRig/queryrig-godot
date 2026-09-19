@@ -69,7 +69,9 @@ var _dormant := false  # 401 or gate-off: drop new events, keep disk queue
 var _consecutive_failures := 0
 var _next_drain_ms := 0
 
-var _http_timeout_ms := 5_000
+# Event uploads must outlast the Worker's 15s ClickHouse timeout plus R2 fallback.
+const EVENT_HTTP_TIMEOUT_MS := 30_000
+const CONFIG_HTTP_TIMEOUT_MS := 5_000
 var _flush_timer: Timer
 var _gate_timer: Timer
 var _crypto := Crypto.new()
@@ -107,7 +109,6 @@ func init(overrides: Dictionary = {}) -> void:
 		return
 	_inert = false
 	_quitting = false
-	_http_timeout_ms = 5_000
 	_jobs.clear()
 	_jobs_sem = Semaphore.new()
 	_next_drain_ms = 0
@@ -472,7 +473,7 @@ func _send_batch(lines: Array[String]) -> String:
 	if _quitting or blocked:
 		return "retryable"
 	var body := "[" + ",".join(lines) + "]"
-	var res := _http(HTTPClient.METHOD_POST, String(_config["endpoint"]), body)
+	var res := _http(HTTPClient.METHOD_POST, String(_config["endpoint"]), body, EVENT_HTTP_TIMEOUT_MS)
 
 	if res["ok"] and res["code"] == 200:
 		var parsed = JSON.parse_string(String(res["body"]))
@@ -632,7 +633,7 @@ func _do_gate_check() -> void:
 	if _quitting:
 		return
 	var url := _origin(String(_config["endpoint"])) + "/v1/config"
-	var res := _http(HTTPClient.METHOD_GET, url, "")
+	var res := _http(HTTPClient.METHOD_GET, url, "", CONFIG_HTTP_TIMEOUT_MS)
 	var enabled: Variant = null
 	if res["ok"] and res["code"] == 200:
 		var parsed = JSON.parse_string(String(res["body"]))
@@ -671,7 +672,7 @@ func _save_cached_gate(enabled: bool) -> void:
 
 # Blocking request on the worker thread via HTTPClient (spec §3.9: no
 # per-request HTTPRequest nodes, no main-thread I/O).
-func _http(method: int, url: String, body: String) -> Dictionary:
+func _http(method: int, url: String, body: String, timeout_ms: int) -> Dictionary:
 	var u := _parse_url(url)
 	if u.is_empty():
 		return {"ok": false, "code": 0, "body": ""}
@@ -679,7 +680,7 @@ func _http(method: int, url: String, body: String) -> Dictionary:
 	var tls: TLSOptions = TLSOptions.client() if u["scheme"] == "https" else null
 	if client.connect_to_host(u["host"], u["port"], tls) != OK:
 		return {"ok": false, "code": 0, "body": ""}
-	var deadline := Time.get_ticks_msec() + _http_timeout_ms
+	var deadline := Time.get_ticks_msec() + timeout_ms
 
 	while client.get_status() in [HTTPClient.STATUS_CONNECTING, HTTPClient.STATUS_RESOLVING]:
 		client.poll()
