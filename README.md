@@ -1,8 +1,7 @@
 # QueryRig SDK for Godot 4
 
-Game analytics for [QueryRig](https://github.com/prhym/queryrig): batched,
-durable event tracking with a runtime on/off switch. Reference implementation
-of the QueryRig engine SDK spec (`docs/sdk-spec.md` in the queryrig repo).
+Game analytics for [QueryRig](https://queryrig.com): batched, durable event
+tracking with a runtime on/off switch.
 
 - **Batched** — events queue in memory and flush every 5 s / 100 events, one
   HTTP request instead of dozens. `track()` validates, stamps, and serializes
@@ -177,27 +176,23 @@ How the SDK reacts when it cannot deliver:
 
 ## Demo
 
-This repo is itself a Godot project: open it and run. The demo scene fires
-spec-shaped events at whatever `queryrig.json` points to — for local
-development, run the SDK harness from the queryrig repo (`npm run
-sdk-harness`) and copy `queryrig.example.json` to `queryrig.json`.
+This repo is itself a Godot project: open it and run. The demo scene sends
+events to whatever `queryrig.json` points to. Copy `queryrig.example.json` to
+`queryrig.json` and replace `api_key` and `endpoint` with a test project's key
+and endpoint, both shown on the project's Keys tab in the QueryRig dashboard.
 
-## Conformance test
+## Tests
 
-With the harness running:
+Local regressions, no server needed:
 
 ```bash
-godot --headless --path . -s res://test/conformance.gd
+godot --headless --path . -s res://test/regression.gd
 ```
 
-Exercises delivery + stamping (including the hashed player id), an outage
-(zero loss, zero duplicates after disk-queue replay), an edge 403 treated as
+`test/conformance.gd` is the end-to-end suite run before each release. It
+covers delivery and stamping (including the hashed player id), an outage (zero
+loss, zero duplicates after disk-queue replay), an edge 403 treated as
 permanent without losing the batch, an unresolvable host backed off as a
 network error (live and at cold start), inert startup with a missing or
-non-HTTPS endpoint, the remote kill switch both directions, and hard-off
-silence. Exit code 0 on pass. To run it against an isolated harness, from the
-queryrig repo: `node scripts/sdk-harness/run-client.mjs godot --headless
---path <this repo> -s res://test/conformance.gd`.
-
-Local regressions without a server:
-`godot --headless --path . -s res://test/regression.gd`.
+non-HTTPS endpoint, the remote kill switch in both directions, and hard-off
+silence. It runs against QueryRig's SDK test server, which is not public.
