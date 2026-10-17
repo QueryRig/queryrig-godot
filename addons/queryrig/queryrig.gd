@@ -13,7 +13,7 @@ extends Node
 # Usage (autoload "QueryRig", added by the editor plugin):
 #   QueryRig.track("level_complete", {"level": 3, "duration_s": 82.5})
 
-const SDK_VERSION := "0.1.0"
+const SDK_VERSION := "0.2.0"
 
 # Spec limits (server-enforced; we stay inside them when building batches).
 const MAX_BATCH_EVENTS := 500
@@ -66,6 +66,9 @@ var _quitting := false
 var _state_mutex := Mutex.new()
 var _gate_enabled := true  # last known remote-gate answer
 var _dormant := false  # 401 or gate-off: drop new events, keep disk queue
+# 403 from the edge (plain HTTP, wrong path): a misconfigured endpoint that no
+# retry can fix. Delivery stops until restart; queued batches are kept.
+var _edge_blocked := false
 var _consecutive_failures := 0
 var _next_drain_ms := 0
 
@@ -107,12 +110,20 @@ func init(overrides: Dictionary = {}) -> void:
 		# packet capture. track() drops immediately.
 		_inert = true
 		return
+	# A key needs its own project's endpoint, over HTTPS (spec §2.2). Without
+	# one the SDK is just as inert, so a bad config never spins on retries.
+	var problem := _endpoint_problem(String(_config["endpoint"]))
+	if not problem.is_empty():
+		push_error("QueryRig: %s; telemetry is off for this run" % problem)
+		_inert = true
+		return
 	_inert = false
 	_quitting = false
 	_jobs.clear()
 	_jobs_sem = Semaphore.new()
 	_next_drain_ms = 0
 	_consecutive_failures = 0
+	_edge_blocked = false
 	# Never transfer a legacy/unrelated queue to a newly configured project.
 	var identity := (String(_config["endpoint"]).trim_suffix("/") + "\n" + String(_config["api_key"])).sha256_text()
 	_DATA_DIR = "user://queryrig/" + identity
@@ -250,7 +261,7 @@ func is_enabled() -> bool:
 	if _inert:
 		return false
 	_state_mutex.lock()
-	var on := not _dormant
+	var on := not _dormant and not _edge_blocked
 	_state_mutex.unlock()
 	return on
 
@@ -280,6 +291,19 @@ func _resolve_config(overrides: Dictionary) -> Dictionary:
 		cfg[k] = overrides[k]
 	cfg["enabled"] = _parse_enabled(cfg["enabled"])
 	return cfg
+
+
+## Why `url` cannot be an ingest endpoint, or "" if it can: HTTPS to any host,
+## or plain HTTP to a loopback address for local development.
+static func _endpoint_problem(url: String) -> String:
+	if url.strip_edges().is_empty():
+		return "no endpoint configured (copy it from the project's Keys tab)"
+	var u := _parse_url(url)
+	if u.is_empty() or not (url.begins_with("https://") or url.begins_with("http://")):
+		return "endpoint %s is not a URL" % url
+	if u["scheme"] == "http" and not (String(u["host"]).to_lower() in ["127.0.0.1", "localhost", "[::1]", "::1"]):
+		return "endpoint %s must use https://" % url
+	return ""
 
 
 static func _parse_enabled(v) -> Variant:
@@ -468,7 +492,7 @@ static func _split_batches(lines: Array[String]) -> Array:
 # duplicate file. Returns "delivered" | "rejected" | "retryable" | "dormant".
 func _send_batch(lines: Array[String]) -> String:
 	_state_mutex.lock()
-	var blocked := _dormant or _now_ms() < _next_drain_ms
+	var blocked := _dormant or _edge_blocked or _now_ms() < _next_drain_ms
 	_state_mutex.unlock()
 	if _quitting or blocked:
 		return "retryable"
@@ -497,12 +521,25 @@ func _send_batch(lines: Array[String]) -> String:
 		_state_mutex.unlock()
 		return "dormant"
 
+	if res["ok"] and res["code"] == 403:
+		# The edge refused the request before QueryRig saw it (spec §1): plain
+		# HTTP or a path outside the ingest API. Resending cannot succeed, and
+		# the events are valid, so keep them and stop until restart.
+		_state_mutex.lock()
+		var first := not _edge_blocked
+		_edge_blocked = true
+		_state_mutex.unlock()
+		if first:
+			push_error("QueryRig: %s refused the upload at the edge (HTTP 403). Check the endpoint on the project's Keys tab; queued events are kept and delivery is stopped until restart." % _config["endpoint"])
+		return "dormant"
+
 	if res["ok"] and (res["code"] == 400 or res["code"] == 413):
 		# Non-retryable: integration bug. The caller keeps a capped record.
 		push_warning("QueryRig: batch rejected with HTTP %d — dropped (see %s/rejected.ndjson)" % [res["code"], _DATA_DIR])
 		return "rejected"
 
-	# Network error, timeout, 5xx: retryable.
+	# Network error (an unresolvable, DNS-blocked host included), timeout,
+	# 5xx: retryable with backoff.
 	_note_failure()
 	return "retryable"
 
@@ -565,7 +602,7 @@ func _drain_disk_one() -> void:
 	if _quitting:
 		return
 	_state_mutex.lock()
-	var blocked := _dormant or _now_ms() < _next_drain_ms
+	var blocked := _dormant or _edge_blocked or _now_ms() < _next_drain_ms
 	_state_mutex.unlock()
 	if blocked:
 		return
@@ -630,7 +667,10 @@ func _note_failure() -> void:
 # ---------------------------------------------------------------- remote gate
 
 func _do_gate_check() -> void:
-	if _quitting:
+	_state_mutex.lock()
+	var edge_blocked := _edge_blocked
+	_state_mutex.unlock()
+	if _quitting or edge_blocked:
 		return
 	var url := _origin(String(_config["endpoint"])) + "/v1/config"
 	var res := _http(HTTPClient.METHOD_GET, url, "", CONFIG_HTTP_TIMEOUT_MS)
@@ -641,8 +681,9 @@ func _do_gate_check() -> void:
 			enabled = bool(parsed["enabled"])
 	elif res["ok"] and res["code"] == 401:
 		enabled = false
-	# On fetch failure keep the cached answer (spec §3.2): losing data over a
-	# flaky config fetch is worse than sending.
+	# On fetch failure (offline, unresolvable host, 5xx, an edge 403) keep the
+	# cached answer (spec §3.2): losing data over a flaky config fetch is worse
+	# than sending. An edge 403 on events is what stops delivery.
 	if enabled == null:
 		return
 	_save_cached_gate(enabled)
@@ -757,20 +798,31 @@ static func _origin(url: String) -> String:
 
 # ---------------------------------------------------------------- utils
 
+# The default player id is pseudonymous: a hash of the device id scoped to the
+# project's ingest host, so the raw hardware id never leaves the device and two
+# games on one machine cannot be linked by it. The host (not the key) is the
+# scope, so rotating the key keeps every player's id.
 func _default_player_id() -> String:
-	var id := OS.get_unique_id()
-	if not id.is_empty():
-		return id
-	# Some platforms return "": persist a random device id instead.
-	var path := _DATA_DIR + "/device_id"
-	if FileAccess.file_exists(path):
-		return FileAccess.get_file_as_string(path).strip_edges()
-	id = _uuid4()
-	var f := FileAccess.open(path, FileAccess.WRITE)
-	if f:
-		f.store_string(id)
-		f.close()
-	return id
+	var raw := OS.get_unique_id()
+	if raw.is_empty():
+		# Some platforms return "": persist a random device id instead. It lives
+		# outside the endpoint/key namespace so a key rotation keeps it.
+		var path := "user://queryrig/device_id"
+		if FileAccess.file_exists(path):
+			raw = FileAccess.get_file_as_string(path).strip_edges()
+		if raw.is_empty():
+			raw = _uuid4()
+			DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path("user://queryrig"))
+			var f := FileAccess.open(path, FileAccess.WRITE)
+			if f:
+				f.store_string(raw)
+				f.close()
+	return _pseudonymous_player_id(raw, String(_config["endpoint"]))
+
+
+static func _pseudonymous_player_id(raw: String, endpoint: String) -> String:
+	var host := String(_parse_url(endpoint).get("host", "")).to_lower()
+	return ("queryrig-player\n" + host + "\n" + raw).sha256_text().substr(0, 32)
 
 
 func _uuid4() -> String:

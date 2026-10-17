@@ -32,9 +32,13 @@ func _initialize() -> void:
 	_test_delivery_and_stamping()
 	_test_slow_fallback()
 	_test_outage_no_loss()
+	_test_edge_forbidden_is_permanent()
+	_test_unresolvable_host_backs_off()
 	_test_remote_kill_switch()
 	_test_shutdown_cancels_upload()
 	_test_hard_off_is_silent()
+	_test_bad_endpoint_is_inert()
+	_test_blocked_host_cold_start()
 
 	_rig.init({"enabled": false})  # quiet shutdown
 	if _failures == 0:
@@ -80,6 +84,9 @@ func _test_delivery_and_stamping() -> void:
 		if not p.has("event_name"):
 			unnamed = p
 	_check(stamped, "stamping: player_id + platform set on every row")
+	var player := String(rows[0]["properties"]["player_id"])
+	_check(player.length() == 32 and player != OS.get_unique_id(),
+		"stamping: default player_id is a hash, not the raw device id")
 	_check(sessions.size() == 1, "stamping: one session_id across the batch")
 	_check(ids.size() == rows.size(), "stamping: event_ids unique")
 	_check(unnamed.get("kind", "") == "boss_defeated" and unnamed.get("boss", "") == "warden",
@@ -130,6 +137,73 @@ func _test_outage_no_loss() -> void:
 	_rig.flush()  # empty queue -> drains one disk batch
 	_check(_wait_for_rows(before + 3, 10.0), "outage: disk queue drains after recovery — zero loss")
 	_check(int(_state()["duplicates"]) == 0, "outage: replay produced no duplicates")
+
+
+func _hard_on_config() -> Dictionary:
+	return {
+		"api_key": "test-key",
+		"endpoint": _harness + "/v1/events",
+		"enabled": true,
+		"flush_interval_s": 999,
+		"gate_poll_interval_s": 999,
+	}
+
+
+func _queue_file_count() -> int:
+	return DirAccess.get_files_at(String(_rig.get("_QUEUE_DIR"))).size()
+
+
+func _test_edge_forbidden_is_permanent() -> void:
+	# Edge 403 (plain HTTP or a path outside the ingest API): the SDK must stop
+	# sending, keep the batch, and not retry until restart.
+	_rig.init(_hard_on_config())
+	_rig.flush()
+	OS.delay_msec(300)
+	var rows_before: int = _state()["rows"]
+	_req("POST", "/__harness/mode", '{"events":"edge-forbidden"}')
+	var before := _events_request_count()
+	_rig.track("edge_refused", {})
+	_rig.flush()
+	_check(_wait_until(func(): return _events_request_count() == before + 1), "edge 403: the batch is attempted once")
+	_check(_wait_until(func(): return not _rig.is_enabled()), "edge 403: the SDK reports itself off")
+	OS.delay_msec(6000)  # longer than the first retry backoff would be
+	_rig.flush()
+	OS.delay_msec(500)
+	_check(_events_request_count() == before + 1, "edge 403: no retry, even after the backoff window")
+	_check(_queue_file_count() > 0, "edge 403: the refused batch is kept on disk")
+
+	# A restart with the corrected endpoint (same here) delivers the kept batch.
+	_req("POST", "/__harness/mode", '{"events":"ok"}')
+	_rig.init(_hard_on_config())
+	for i in range(4):
+		_rig.flush()
+		OS.delay_msec(300)
+	_check(_wait_for_rows(rows_before + 1, 10.0), "edge 403: kept events arrive after a restart")
+	_check(int(_state()["duplicates"]) == 0, "edge 403: no duplicates after the restart")
+
+
+func _test_unresolvable_host_backs_off() -> void:
+	# A DNS-blocked hostname is a network error: back off, keep, recover.
+	_rig.init(_hard_on_config())
+	_rig.flush()
+	OS.delay_msec(300)
+	var rows_before: int = _state()["rows"]
+	var attempts_before: int = _state()["unreachableAttempts"]
+	_req("POST", "/__harness/mode", '{"events":"unresolvable"}')
+	_rig.track("while_unreachable", {})
+	_rig.flush()
+	_check(_wait_until(func(): return int(_state()["unreachableAttempts"]) > attempts_before), "unreachable: the batch is attempted")
+	_rig.flush()
+	_rig.flush()
+	OS.delay_msec(1000)
+	_check(int(_state()["unreachableAttempts"]) == attempts_before + 1, "unreachable: backoff holds further attempts")
+	_check(int(_rig.get("_consecutive_failures")) >= 1 and _queue_file_count() > 0, "unreachable: counted as a failure, batch kept")
+	_check(_rig.is_enabled(), "unreachable: not treated as a permanent refusal")
+
+	_req("POST", "/__harness/mode", '{"events":"ok"}')
+	OS.delay_msec(7000)  # ride out the first retry backoff (~5s + jitter)
+	_rig.flush()
+	_check(_wait_for_rows(rows_before + 1, 10.0), "unreachable: recovers by itself and delivers")
 
 
 func _test_remote_kill_switch() -> void:
@@ -187,6 +261,41 @@ func _test_hard_off_is_silent() -> void:
 	_rig.flush()
 	OS.delay_msec(1000)
 	_check(int(_state()["requests"]) == 0, "hard-off: zero network calls of any kind")
+
+
+func _test_bad_endpoint_is_inert() -> void:
+	# A key with no endpoint, or a non-HTTPS one off loopback, must be inert:
+	# no requests, no retries (spec §2.2).
+	for endpoint in ["", "http://ingest.example.com/v1/events", "ingest.example.com/v1/events"]:
+		_rig.init({"api_key": "test-key", "endpoint": endpoint, "enabled": true})
+		_req("POST", "/__harness/reset", "{}")
+		_rig.track("never_sent", {})
+		_rig.flush()
+		OS.delay_msec(500)
+		_check(bool(_rig.get("_inert")) and int(_state()["requests"]) == 0,
+			"bad endpoint: inert with %s" % ("no endpoint" if endpoint.is_empty() else endpoint))
+	_check(String(_rig._endpoint_problem("https://3fa91c0e.qrig.net/v1/events")).is_empty()
+		and String(_rig._endpoint_problem(_harness + "/v1/events")).is_empty(),
+		"bad endpoint: HTTPS and loopback HTTP are accepted")
+
+
+func _test_blocked_host_cold_start() -> void:
+	# Starting on a DNS-blocked hostname: the gate fetch fails, the cached (or
+	# default) answer holds, and events queue on disk instead of being lost.
+	var blocked := "https://blocked.invalid/v1/events"
+	if OS.has_environment("QUERYRIG_TEST_UNRESOLVABLE_ENDPOINT"):
+		blocked = OS.get_environment("QUERYRIG_TEST_UNRESOLVABLE_ENDPOINT")
+	_rig.init({"api_key": "test-key", "endpoint": blocked, "enabled": "remote",
+		"flush_interval_s": 999, "gate_poll_interval_s": 999})
+	_rig.track("cold_start_blocked", {})
+	_rig.flush()
+	_check(_wait_until(func(): return _queue_file_count() > 0), "blocked host: events queue on disk")
+	OS.delay_msec(1000)
+	_check(not bool(_rig.get("_inert")) and _rig.is_enabled(), "blocked host: still enabled, waiting to retry")
+	_check(_wait_until(func(): return int(_rig.get("_consecutive_failures")) >= 1), "blocked host: the failure backs off")
+	_rig.shutdown()
+	for file in DirAccess.get_files_at(String(_rig.get("_QUEUE_DIR"))):
+		DirAccess.remove_absolute(ProjectSettings.globalize_path(String(_rig.get("_QUEUE_DIR")) + "/" + file))
 
 
 # ------------------------------------------------------------------ helpers

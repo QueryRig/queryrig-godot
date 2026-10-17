@@ -46,6 +46,14 @@ func _initialize() -> void:
 	check(rig._valid_json(deep), "eight container levels accepted")
 	current["child"] = {}
 	check(not rig._valid_json(deep), "ninth empty container rejected")
+	check(rig._endpoint_problem("https://3fa91c0e.qrig.net/v1/events").is_empty(), "https endpoint accepted")
+	check(rig._endpoint_problem("http://127.0.0.1:8788/v1/events").is_empty(), "loopback http endpoint accepted")
+	check(not rig._endpoint_problem("").is_empty(), "missing endpoint refused")
+	check(not rig._endpoint_problem("http://3fa91c0e.qrig.net/v1/events").is_empty(), "plain http off loopback refused")
+	check(not rig._endpoint_problem("3fa91c0e.qrig.net/v1/events").is_empty(), "endpoint without a scheme refused")
+	var a: String = rig._pseudonymous_player_id("device-1", "https://3fa91c0e.qrig.net/v1/events")
+	check(a.length() == 32 and a == rig._pseudonymous_player_id("device-1", "https://3FA91C0E.qrig.net/v1/events"), "player id hash is stable per project host")
+	check(a != rig._pseudonymous_player_id("device-1", "https://0b7e44d2.qrig.net/v1/events") and not a.contains("device-1"), "player id differs across projects and hides the device id")
 	var lines: Array[String] = []
 	for i in range(500):
 		lines.append(JSON.stringify({"text": "中".repeat(300)}))
