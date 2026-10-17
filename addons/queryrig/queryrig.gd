@@ -403,8 +403,11 @@ func _collecting() -> bool:
 	var enabled: Variant = _config["enabled"]
 	if enabled is bool:
 		return enabled
+	# Remote mode drops new events while dormant (spec §3.2), including after
+	# an upload 401 the gate has not confirmed yet: a disabled key stops
+	# collection at once, not at the next gate poll.
 	_state_mutex.lock()
-	var on := _gate_enabled
+	var on := _gate_enabled and not _dormant
 	_state_mutex.unlock()
 	return on
 

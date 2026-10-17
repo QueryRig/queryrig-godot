@@ -35,6 +35,7 @@ func _initialize() -> void:
 	_test_edge_forbidden_is_permanent()
 	_test_unresolvable_host_backs_off()
 	_test_remote_kill_switch()
+	_test_upload_401_stops_collection()
 	_test_shutdown_cancels_upload()
 	_test_hard_off_is_silent()
 	_test_bad_endpoint_is_inert()
@@ -204,6 +205,37 @@ func _test_unresolvable_host_backs_off() -> void:
 	OS.delay_msec(7000)  # ride out the first retry backoff (~5s + jitter)
 	_rig.flush()
 	_check(_wait_for_rows(rows_before + 1, 10.0), "unreachable: recovers by itself and delivers")
+
+
+func _test_upload_401_stops_collection() -> void:
+	# A key disabled between gate polls: the first upload's 401 must stop
+	# collection at once in remote mode (spec §3.2), not at the next poll.
+	_rig.init({
+		"api_key": "test-key",
+		"endpoint": _harness + "/v1/events",
+		"enabled": "remote",
+		"flush_interval_s": 999,
+		"gate_poll_interval_s": 999,
+	})
+	_check(_wait_until(func(): return _rig.is_enabled(), 5.0), "upload 401: starts enabled")
+	_req("POST", "/__harness/keys", '{"key":"test-key","disabled":true}')
+	var before := _events_request_count()
+	_rig.track("before_401", {})
+	_rig.flush()
+	_check(_wait_until(func(): return _events_request_count() > before and not _rig.is_enabled()),
+		"upload 401: the refused upload turns the SDK off without a gate poll")
+	var files := _queue_file_count()
+	for i in range(3):
+		_rig.track("after_401", {})
+	_rig.flush()
+	OS.delay_msec(500)
+	_check((_rig.get("_queue") as Array).is_empty() and _queue_file_count() == files,
+		"upload 401: new events are dropped, not queued")
+	_check(_queue_file_count() > 0, "upload 401: the refused batch is kept on disk")
+
+	_req("POST", "/__harness/keys", '{"key":"test-key","disabled":false}')
+	_rig.refresh_gate()
+	_check(_wait_until(func(): return _rig.is_enabled(), 5.0), "upload 401: re-enabling resumes collection")
 
 
 func _test_remote_kill_switch() -> void:
