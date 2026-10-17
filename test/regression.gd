@@ -63,6 +63,11 @@ func _initialize() -> void:
 		count += batch.size()
 		check(("[" + ",".join(batch) + "]").to_utf8_buffer().size() <= rig.FLUSH_MAX_BYTES, "batch fits UTF-8 wire budget")
 	check(count == lines.size(), "batch splitting preserves all events")
+	check(rig._note_key_refused("https://3fa91c0e.qrig.net/v1/events"), "first 401 warns")
+	check(not rig._note_key_refused("https://3fa91c0e.qrig.net/v1/config"), "later 401s in the same dormant spell stay quiet")
+	rig._note_success()
+	check(rig._note_key_refused("https://3fa91c0e.qrig.net/v1/events"), "a 401 after the key works again warns again")
+	rig._key_refused = false
 	rig._DATA_DIR = "user://queryrig/regression-" + rig._uuid4()
 	rig._QUEUE_DIR = rig._DATA_DIR + "/queue"
 	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(rig._QUEUE_DIR))

@@ -66,6 +66,9 @@ var _quitting := false
 var _state_mutex := Mutex.new()
 var _gate_enabled := true  # last known remote-gate answer
 var _dormant := false  # 401 or gate-off: drop new events, keep disk queue
+# Set by the first 401 and cleared once the key is accepted again, so a
+# refused key is reported once per dormant spell, not on every gate poll.
+var _key_refused := false
 # 403 from the edge (plain HTTP, wrong path): a misconfigured endpoint that no
 # retry can fix. Delivery stops until restart; queued batches are kept.
 var _edge_blocked := false
@@ -124,6 +127,7 @@ func init(overrides: Dictionary = {}) -> void:
 	_next_drain_ms = 0
 	_consecutive_failures = 0
 	_edge_blocked = false
+	_key_refused = false
 	# Never transfer a legacy/unrelated queue to a newly configured project.
 	var identity := (String(_config["endpoint"]).trim_suffix("/") + "\n" + String(_config["api_key"])).sha256_text()
 	_DATA_DIR = "user://queryrig/" + identity
@@ -522,6 +526,7 @@ func _send_batch(lines: Array[String]) -> String:
 		_state_mutex.lock()
 		_dormant = true
 		_state_mutex.unlock()
+		_note_key_refused(String(_config["endpoint"]))
 		return "dormant"
 
 	if res["ok"] and res["code"] == 403:
@@ -655,7 +660,19 @@ func _note_success() -> void:
 	_state_mutex.lock()
 	_consecutive_failures = 0
 	_next_drain_ms = 0
+	_key_refused = false
 	_state_mutex.unlock()
+
+
+# Warns on the first 401 of a dormant spell; true when it did.
+func _note_key_refused(url: String) -> bool:
+	_state_mutex.lock()
+	var first := not _key_refused
+	_key_refused = true
+	_state_mutex.unlock()
+	if first:
+		push_warning("QueryRig: %s refused the ingest key (HTTP 401). It may be disabled, rotated, or from another project; check the Keys tab. Events stay queued and sending resumes when the key is enabled." % url)
+	return first
 
 
 func _note_failure() -> void:
@@ -684,6 +701,7 @@ func _do_gate_check() -> void:
 			enabled = bool(parsed["enabled"])
 	elif res["ok"] and res["code"] == 401:
 		enabled = false
+		_note_key_refused(url)
 	# On fetch failure (offline, unresolvable host, 5xx, an edge 403) keep the
 	# cached answer (spec §3.2): losing data over a flaky config fetch is worse
 	# than sending. An edge 403 on events is what stops delivery.
@@ -693,6 +711,8 @@ func _do_gate_check() -> void:
 	_state_mutex.lock()
 	_gate_enabled = enabled
 	_dormant = not enabled
+	if enabled:
+		_key_refused = false
 	_state_mutex.unlock()
 
 
