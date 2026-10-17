@@ -13,7 +13,7 @@ extends Node
 # Usage (autoload "QueryRig", added by the editor plugin):
 #   QueryRig.track("level_complete", {"level": 3, "duration_s": 82.5})
 
-const SDK_VERSION := "0.2.0"
+const SDK_VERSION := "0.2.1"
 
 # Spec limits (server-enforced; we stay inside them when building batches).
 const MAX_BATCH_EVENTS := 500
