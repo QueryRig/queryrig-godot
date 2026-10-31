@@ -25,6 +25,9 @@ func _initialize() -> void:
 		quit(2)
 		return
 	_req("POST", "/__harness/reset", "{}")
+	# Refused batches are kept on disk by design, so a previous run leaves
+	# queue files and a cached gate behind. Start every run from a clean slate.
+	_remove_tree("user://queryrig")
 
 	_rig = load("res://addons/queryrig/queryrig.gd").new()
 	root.add_child(_rig)
@@ -154,6 +157,16 @@ func _queue_file_count() -> int:
 	return DirAccess.get_files_at(String(_rig.get("_QUEUE_DIR"))).size()
 
 
+func _remove_tree(dir: String) -> void:
+	if not DirAccess.dir_exists_absolute(dir):
+		return
+	for sub in DirAccess.get_directories_at(dir):
+		_remove_tree(dir + "/" + sub)
+	for file in DirAccess.get_files_at(dir):
+		DirAccess.remove_absolute(ProjectSettings.globalize_path(dir + "/" + file))
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(dir))
+
+
 func _test_edge_forbidden_is_permanent() -> void:
 	# Edge 403 (plain HTTP or a path outside the ingest API): the SDK must stop
 	# sending, keep the batch, and not retry until restart.
@@ -210,6 +223,7 @@ func _test_unresolvable_host_backs_off() -> void:
 func _test_upload_401_stops_collection() -> void:
 	# A key disabled between gate polls: the first upload's 401 must stop
 	# collection at once in remote mode (spec §3.2), not at the next poll.
+	var polls := _config_request_count()
 	_rig.init({
 		"api_key": "test-key",
 		"endpoint": _harness + "/v1/events",
@@ -217,7 +231,11 @@ func _test_upload_401_stops_collection() -> void:
 		"flush_interval_s": 999,
 		"gate_poll_interval_s": 999,
 	})
-	_check(_wait_until(func(): return _rig.is_enabled(), 5.0), "upload 401: starts enabled")
+	# is_enabled() is true at once from the cached gate, while init's own gate
+	# poll is still queued. Let that poll reach the harness first, or it would
+	# see the disabled key and be what turns the SDK off.
+	_check(_wait_until(func(): return _config_request_count() > polls and _rig.is_enabled(), 5.0),
+		"upload 401: starts enabled")
 	_req("POST", "/__harness/keys", '{"key":"test-key","disabled":true}')
 	var before := _events_request_count()
 	_rig.track("before_401", {})
@@ -347,6 +365,11 @@ func _state() -> Dictionary:
 func _events_request_count() -> int:
 	var reqs: Array = _req("GET", "/__harness/requests")["json"]
 	return reqs.filter(func(r): return r["path"] == "/v1/events").size()
+
+
+func _config_request_count() -> int:
+	var reqs: Array = _req("GET", "/__harness/requests")["json"]
+	return reqs.filter(func(r): return r["path"] == "/v1/config").size()
 
 
 func _wait_for_rows(n: int, timeout_s := 5.0) -> bool:
