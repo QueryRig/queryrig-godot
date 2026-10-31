@@ -88,8 +88,8 @@ Send natural types here — the conversion happens server-side.
 ## Configure
 
 1. In your file manager (or the Godot editor's **FileSystem** dock), find
-   `queryrig.example.json` next to `project.godot` and make a copy of it
-   named `queryrig.json`, in that same folder.
+   `addons/queryrig/queryrig.example.json` and copy it to your project's
+   root folder (next to `project.godot`), naming the copy `queryrig.json`.
 2. Open `queryrig.json` in any text editor and fill in `api_key` and
    `endpoint` — both are shown on the **Keys** tab of your QueryRig project
    (the dashboard at your QueryRig site). Leave the quotes in place; only
@@ -177,9 +177,11 @@ How the SDK reacts when it cannot deliver:
 ## Demo
 
 This repo is itself a Godot project: open it and run. The demo scene sends
-events to whatever `queryrig.json` points to. Copy `queryrig.example.json` to
-`queryrig.json` and replace `api_key` and `endpoint` with a test project's key
-and endpoint, both shown on the project's Keys tab in the QueryRig dashboard.
+events to whatever `queryrig.json` points to. Copy
+`addons/queryrig/queryrig.example.json` to the project root (next to
+`project.godot`) as `queryrig.json` and replace `api_key` and `endpoint` with
+a test project's key and endpoint, both shown on the project's Keys tab in the
+QueryRig dashboard.
 
 ## Tests
 

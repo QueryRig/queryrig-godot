@@ -3,7 +3,7 @@ extends Control
 # Demo scene: buttons that fire spec-shaped game events, plus a status line.
 # Point queryrig.json (or env vars) at a real project — or run the SDK
 # conformance harness from the queryrig repo (`npm run sdk-harness`) and use
-# the defaults in queryrig.example.json.
+# the defaults in addons/queryrig/queryrig.example.json.
 
 var _status: Label
 var _sent := 0
